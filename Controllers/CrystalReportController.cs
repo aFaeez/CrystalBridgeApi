@@ -1,21 +1,25 @@
-﻿
+﻿using CrystalDecisions.CrystalReports.Engine;
+using CrystalDecisions.Shared;
+using System;
+using System.Configuration; // Add this!
+using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Web.Http;
-using CrystalDecisions.CrystalReports.Engine;
-using CrystalDecisions.Shared;
-using System.IO;
-using System;
-
 public class CrystalReportController : ApiController
 {
     [HttpGet]
     [Route("api/crystalreport/exporttopdf")]
-    public HttpResponseMessage ExportToPdf(string reportName, string para = null, string val = null)
+    public HttpResponseMessage ExportToPdf(string reportName, string para = null, string val = null, string printNo = null)
     {
         try
         {
-            string reportFolder = @"D:\Project\Reports";
+            // Read from Web.config
+            string reportFolder = ConfigurationManager.AppSettings["ReportFolder"];
+            string server = ConfigurationManager.AppSettings["ReportServer"];
+            string db = ConfigurationManager.AppSettings["ReportDatabase"];
+            string user = ConfigurationManager.AppSettings["ReportUser"];
+            string pwd = ConfigurationManager.AppSettings["ReportPassword"];
             string rptPath = Path.Combine(reportFolder, reportName + ".rpt");
             if (!File.Exists(rptPath))
                 return Request.CreateErrorResponse(HttpStatusCode.NotFound, "Report not found: " + rptPath);
@@ -23,13 +27,13 @@ public class CrystalReportController : ApiController
             ReportDocument reportDoc = new ReportDocument();
             reportDoc.Load(rptPath);
 
-            // Set connection info as needed
+            // Set connection info
             var connInfo = new ConnectionInfo
             {
-                ServerName = "10.2.80.239",
-                DatabaseName = "BCS",
-                UserID = "sa",
-                Password = "2770"
+                ServerName = server,
+                DatabaseName = db,
+                UserID = user,
+                Password = pwd
             };
             foreach (Table table in reportDoc.Database.Tables)
             {
@@ -41,7 +45,6 @@ public class CrystalReportController : ApiController
             // Set parameters if any
             if (!string.IsNullOrEmpty(para) && !string.IsNullOrEmpty(val))
             {
-                // Replace underscores with ampersands in VALUES
                 string safeVal = val.Replace("_", "&");
                 string[] paraArr = para.Split('|');
                 string[] valArr = safeVal.Split('|');
@@ -53,11 +56,47 @@ public class CrystalReportController : ApiController
                 {
                     var paramName = paraArr[i];
                     var paramValue = valArr[i];
-                    var paraValue = new ParameterDiscreteValue { Value = paramValue };
-                    var currValue = crParamDefinitions[paramName].CurrentValues;
-                    currValue.Add(paraValue);
-                    crParamDefinitions[paramName].ApplyCurrentValues(currValue);
+                    bool paramExists = false;
+                    foreach (ParameterFieldDefinition field in crParamDefinitions)
+                    {
+                        if (field.Name.Equals(paramName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            paramExists = true;
+                            break;
+                        }
+                    }
+                    if (paramExists)
+                    {
+                        var paraValue = new ParameterDiscreteValue { Value = paramValue };
+                        var currValue = crParamDefinitions[paramName].CurrentValues;
+                        currValue.Add(paraValue);
+                        crParamDefinitions[paramName].ApplyCurrentValues(currValue);
+                    }
+
                 }
+            }
+
+            // Handle printNo if provided and report expects it
+            if (!string.IsNullOrEmpty(printNo))
+            {
+                var crParamDefinitions = reportDoc.DataDefinition.ParameterFields;
+                bool printNoExists = false;
+                foreach (ParameterFieldDefinition field in crParamDefinitions)
+                {
+                    if (field.Name.Equals("printNo", StringComparison.OrdinalIgnoreCase))
+                    {
+                        printNoExists = true;
+                        break;
+                    }
+                }
+                if (printNoExists)
+                {
+                    var paraValue = new ParameterDiscreteValue { Value = printNo };
+                    var currValue = crParamDefinitions["printNo"].CurrentValues;
+                    currValue.Add(paraValue);
+                    crParamDefinitions["printNo"].ApplyCurrentValues(currValue);
+                }
+
             }
 
             // Export to PDF and return as stream
@@ -78,5 +117,4 @@ public class CrystalReportController : ApiController
             return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex.ToString());
         }
     }
-
 }
