@@ -6,6 +6,7 @@ using System.Configuration;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Threading.Tasks;
 using System.Web.Http;
 
 public class CrystalReportController : ApiController
@@ -248,36 +249,85 @@ public class CrystalReportController : ApiController
                 }
             }
 
-            // --- Export to PDF or Excel ---
+            // --- Determine export format ---
             ExportFormatType exportFormat = ExportFormatType.PortableDocFormat;
             string contentType = "application/pdf";
             string fileExt = "pdf";
 
-            // Detect if Excel is requested
             if (!string.IsNullOrEmpty(docType) && docType.ToLower().Contains("excel"))
             {
-                exportFormat = ExportFormatType.ExcelWorkbook; // Or ExcelRecord for raw .xls
+                exportFormat = ExportFormatType.ExcelWorkbook;
                 contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
                 fileExt = "xlsx";
             }
 
-            Stream exportStream = reportDoc.ExportToStream(exportFormat);
-            exportStream.Seek(0, SeekOrigin.Begin); // Ensure stream is at beginning
+            // --- Special logic only for 3 specific report names ---
+            bool isCertReport =
+                reportName.Equals("CertificateWithAppendixWithFS_IN", StringComparison.OrdinalIgnoreCase) ||
+                reportName.Equals("CertificateWithAppendixWithFS_EXT", StringComparison.OrdinalIgnoreCase) ||
+                reportName.Equals("CertificateWithAppendix", StringComparison.OrdinalIgnoreCase);
 
-            var result = new HttpResponseMessage(HttpStatusCode.OK)
+            if (isCertReport)
             {
-                Content = new StreamContent(exportStream)
-            };
-            result.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
-            result.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
+                // 1. Export to temp path for download
+                string tempPath = Path.Combine(
+                    ConfigurationManager.AppSettings["ReportFolder"],
+                    $"{Guid.NewGuid()}.{fileExt}"
+                );
+                reportDoc.ExportToDisk(exportFormat, tempPath);
+
+                // 2. Export copy to certificate folder
+                string certPath = ConfigurationManager.AppSettings["SPSLoadCertificatePath"];
+                string safeVal = val?.Replace("/", "").Replace("|", "_").Replace("&", "_") ?? "Default";
+                string printSuffix = string.IsNullOrEmpty(printNo) ? "" : $"_{printNo}";
+                string certFileName = Path.Combine(certPath, $"{safeVal}{printSuffix}.pdf");
+                reportDoc.ExportToDisk(ExportFormatType.PortableDocFormat, certFileName);
+
+                // 3. Return stream of the temp file
+                var result = new HttpResponseMessage(HttpStatusCode.OK);
+                result.Content = new StreamContent(new FileStream(tempPath, FileMode.Open, FileAccess.Read));
+                result.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
+                result.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
+                {
+                    FileName = $"{reportName}.{fileExt}"
+                };
+
+                // 4. Delete temp file after sending
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        System.Threading.Thread.Sleep(5000);
+                        if (File.Exists(tempPath))
+                            File.Delete(tempPath);
+                    }
+                    catch { /* ignore */ }
+                });
+
+                return result;
+            }
+            else
             {
-                FileName = $"{reportName}.{fileExt}"
-            };
-            return result;
+                // --- Normal path: export to memory stream and return ---
+                Stream exportStream = reportDoc.ExportToStream(exportFormat);
+                exportStream.Seek(0, SeekOrigin.Begin);
+
+                var result = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StreamContent(exportStream)
+                };
+                result.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
+                result.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
+                {
+                    FileName = $"{reportName}.{fileExt}"
+                };
+                return result;
+            }
 
         }
         catch (Exception ex)
         {
+            Console.WriteLine("ExportToPdf Error: " + ex.ToString());
             return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex.ToString());
         }
     }
