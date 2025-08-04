@@ -11,6 +11,15 @@ using System.Web.Http;
 
 public class CrystalReportController : ApiController
 {
+    private void SafeApplyParameter(ParameterFieldDefinition field, object value)
+    {
+        if (!string.IsNullOrEmpty(field.ReportName)) return; // skip linked parameter
+        var values = new ParameterValues();
+        values.Add(new ParameterDiscreteValue { Value = value });
+        try { field.ApplyCurrentValues(values); }
+        catch { } // silently ignore
+    }
+
     [HttpGet]
     [Route("api/crystalreport/exporttopdf")]
     public HttpResponseMessage ExportToPdf(
@@ -25,8 +34,8 @@ public class CrystalReportController : ApiController
         string isPW = null,
         string isQSME = null,
         string file = null,
-        string docType = null
-        )
+        string docType = null,
+        string userName = null)
     {
         try
         {
@@ -269,43 +278,43 @@ public class CrystalReportController : ApiController
 
             if (isCertReport)
             {
-                // 1. Export to temp path for download
-                string tempPath = Path.Combine(
-                    ConfigurationManager.AppSettings["ReportFolder"],
-                    $"{Guid.NewGuid()}.{fileExt}"
-                );
-                reportDoc.ExportToDisk(exportFormat, tempPath);
+                // Add UserName only for cert reports
+                if (!string.IsNullOrWhiteSpace(userName))
+                {
+                    foreach (ParameterFieldDefinition field in crParamDefinitions)
+                    {
+                        if (field.Name.Equals("userName", StringComparison.OrdinalIgnoreCase))
+                        {
+                            SafeApplyParameter(field, userName);
+                            break;
+                        }
+                    }
+                }
 
-                // 2. Export copy to certificate folder
+                string tempFile = Path.Combine(reportFolder, $"{Guid.NewGuid()}.{fileExt}");
+                reportDoc.ExportToDisk(exportFormat, tempFile);
+
                 string certPath = ConfigurationManager.AppSettings["SPSLoadCertificatePath"];
-                string safeVal = val?.Replace("/", "").Replace("|", "_").Replace("&", "_") ?? "Default";
-                string printSuffix = string.IsNullOrEmpty(printNo) ? "" : $"_{printNo}";
-                string certFileName = Path.Combine(certPath, $"{safeVal}{printSuffix}.pdf");
-                reportDoc.ExportToDisk(ExportFormatType.PortableDocFormat, certFileName);
+                string safeFile = val?.Replace("/", "").Replace("|", "_").Replace("&", "_") ?? "Cert";
+                string suffix = string.IsNullOrEmpty(printNo) ? "" : $"_{printNo}";
+                string certFile = Path.Combine(certPath, $"{safeFile}{suffix}.pdf");
+                reportDoc.ExportToDisk(ExportFormatType.PortableDocFormat, certFile);
 
-                // 3. Return stream of the temp file
                 var result = new HttpResponseMessage(HttpStatusCode.OK);
-                result.Content = new StreamContent(new FileStream(tempPath, FileMode.Open, FileAccess.Read));
+                result.Content = new StreamContent(new FileStream(tempFile, FileMode.Open, FileAccess.Read));
                 result.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
                 result.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
                 {
                     FileName = $"{reportName}.{fileExt}"
                 };
 
-                // 4. Delete temp file after sending
-                _ = Task.Run(() =>
-                {
-                    try
-                    {
-                        System.Threading.Thread.Sleep(5000);
-                        if (File.Exists(tempPath))
-                            File.Delete(tempPath);
-                    }
-                    catch { /* ignore */ }
+                _ = Task.Run(() => {
+                    try { System.Threading.Thread.Sleep(5000); if (File.Exists(tempFile)) File.Delete(tempFile); } catch { }
                 });
 
                 return result;
             }
+
             else
             {
                 // --- Normal path: export to memory stream and return ---
