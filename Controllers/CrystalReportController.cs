@@ -8,6 +8,7 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Web.Http;
+using System.Web.Hosting;
 
 public class CrystalReportController : ApiController
 {
@@ -238,6 +239,11 @@ public class CrystalReportController : ApiController
         {
             // --- Config ---
             string reportFolder = ConfigurationManager.AppSettings["ReportFolder"];
+            if (reportFolder.StartsWith("~"))
+            {
+                reportFolder = HostingEnvironment.MapPath(reportFolder);
+            }
+
             string server = ConfigurationManager.AppSettings["ReportServer"];        // OLE DB host
             string db = ConfigurationManager.AppSettings["ReportDatabase"];
             string user = ConfigurationManager.AppSettings["ReportUser"];
