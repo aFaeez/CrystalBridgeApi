@@ -7,8 +7,9 @@ using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Http;
-using System.Web.Http;
+using System.Threading;
 using System.Web.Hosting;
+using System.Web.Http;
 
 public class CrystalReportController : ApiController
 {
@@ -39,33 +40,29 @@ public class CrystalReportController : ApiController
             logon.ConnectionInfo = conn;
             table.ApplyLogOnInfo(logon);
 
-            // Location normalization:
-            // - OLE DB: qualify if bare
-            // - ODBC RDO: leave as-is; if completely bare, prefer "dbo.Table"
+            // Keep the original binding for stored procs/commands.
+            // Crystal marks procs with a ;1 (or ;2, etc). Commands also behave differently.
             var loc = table.Location ?? "";
-            int semi = loc.IndexOf(';'); // C# 7.3-compatible (no range operator)
-            var locNoSuffix = semi >= 0 ? loc.Substring(0, semi) : loc;
+            var name = table.Name ?? "";
 
-            if (!isOdbcRdo)
+            bool looksLikeStoredProc = loc.IndexOf(';') >= 0 || name.IndexOf(';') >= 0;
+
+            // For ODBC/RDO we already avoid forcing database names — also skip location rewrite
+            if (isOdbcRdo || looksLikeStoredProc)
+                return;
+
+            // If location is already qualified, leave it alone
+            int semi = loc.IndexOf(';');
+            var locNoSuffix = semi >= 0 ? loc.Substring(0, semi) : loc;
+            if (locNoSuffix.Contains(".")) return;
+
+            // Qualify only plain tables, and only when we actually have a database name
+            if (!string.IsNullOrEmpty(database))
             {
-                // OLE DB path: qualify to <db>.dbo.<table> if needed
-                if (!string.IsNullOrEmpty(database) &&
-                    (!locNoSuffix.Contains(".") ||
-                     string.Equals(locNoSuffix, table.Name, StringComparison.OrdinalIgnoreCase)))
-                {
-                    try { table.Location = string.Format("{0}.dbo.{1}", database, table.Name); } catch { }
-                }
-            }
-            else
-            {
-                // ODBC (RDO) path: DO NOT force database; keep schema-only
-                if (!locNoSuffix.Contains(".") ||
-                    string.Equals(locNoSuffix, table.Name, StringComparison.OrdinalIgnoreCase))
-                {
-                    try { table.Location = string.Format("dbo.{0}", table.Name); } catch { }
-                }
+                try { table.Location = $"{database}.dbo.{table.Name}"; } catch { /* ignore */ }
             }
         }
+
 
         foreach (Table t in reportDoc.Database.Tables) ApplyToTable(t);
         foreach (ReportDocument sub in reportDoc.Subreports)
@@ -215,6 +212,107 @@ public class CrystalReportController : ApiController
         try { field.ApplyCurrentValues(vals); } catch { /* ignore */ }
     }
 
+
+    // Force Group Header/Footer to be visible (main + subreports) without SectionKind
+    private static void ForceShowGroupSections(ReportDocument doc)
+    {
+        // Match "GroupHeaderSection" / "GroupFooterSection" (case-insensitive),
+        // and also tolerate GH/GF naming just in case.
+        bool IsGroupSectionName(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return false;
+            var u = n.ToUpperInvariant();
+            return u.Contains("GROUPHEADER") || u.Contains("GROUPFOOTER") || u.StartsWith("GH") || u.StartsWith("GF");
+        }
+
+        void UnsuppressSections(ReportDocument d)
+        {
+            foreach (Section s in d.ReportDefinition.Sections)
+            {
+                var name = s.Name ?? "";
+                if (IsGroupSectionName(name))
+                {
+                    try { s.SectionFormat.EnableSuppress = false; } catch { }
+                    try { s.SectionFormat.EnableUnderlaySection = false; } catch { }
+                    try { s.SectionFormat.EnableKeepTogether = true; } catch { }
+                    // Do NOT touch EnableRepeatOnNewPage (not present in some runtimes)
+                }
+            }
+        }
+
+        // Main report
+        UnsuppressSections(doc);
+
+        // Subreports: open each and unsuppress
+        try
+        {
+            foreach (ReportDocument sub in doc.Subreports)
+            {
+                try
+                {
+                    var sdoc = doc.OpenSubreport(sub.Name);
+                    UnsuppressSections(sdoc);
+                }
+                catch { /* ignore inaccessible subreports */ }
+            }
+        }
+        catch { /* no subreports or older runtime behavior */ }
+    }
+
+    // Try to set a boolean parameter (if it exists). Avoids ParameterValueType checks.
+    private static void TrySetBoolParam(ReportDocument doc, string name, bool value)
+    {
+        try
+        {
+            foreach (ParameterFieldDefinition f in doc.DataDefinition.ParameterFields)
+            {
+                if (f.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                {
+                    var vals = new ParameterValues();
+                    vals.Clear();
+                    vals.Add(new ParameterDiscreteValue { Value = value });
+                    try { f.ApplyCurrentValues(vals); } catch { }
+                    break;
+                }
+            }
+
+            // Also apply to subreports if they mirror the parameter
+            foreach (ReportDocument sub in doc.Subreports)
+            {
+                try
+                {
+                    var sdoc = doc.OpenSubreport(sub.Name);
+                    foreach (ParameterFieldDefinition f in sdoc.DataDefinition.ParameterFields)
+                    {
+                        if (f.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var vals = new ParameterValues();
+                            vals.Clear();
+                            vals.Add(new ParameterDiscreteValue { Value = value });
+                            try { f.ApplyCurrentValues(vals); } catch { }
+                            break;
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { /* tolerate runtimes with quirky param collections */ }
+    }
+
+    private static void NormalizeReportOptions(ReportDocument doc)
+    {
+        // These two exist on older runtimes; ignore if not.
+        try { doc.ReportOptions.EnableSaveDataWithReport = false; } catch { }
+        try { doc.ReportOptions.ConvertNullFieldToDefault = true; } catch { }
+
+        // Older runtimes don't have DiscardSavedData(). Use Refresh() instead.
+        try { doc.Refresh(); } catch { }
+    }
+
+
+
+
     [HttpGet]
     [Route("api/crystalreport/exporttopdf")]
     public HttpResponseMessage ExportToPdf(
@@ -237,6 +335,13 @@ public class CrystalReportController : ApiController
 
         try
         {
+            //var ci = (CultureInfo)CultureInfo.CreateSpecificCulture("en-MY"); // or your locale
+            //ci.NumberFormat.NumberDecimalDigits = 2;         // affects plain numbers
+            //ci.NumberFormat.CurrencyDecimalDigits = 2;       // affects currency fields
+            //ci.NumberFormat.PercentDecimalDigits = 2;        // if you have percents
+            //Thread.CurrentThread.CurrentCulture = ci;
+            //Thread.CurrentThread.CurrentUICulture = ci;
+
             // --- Config ---
             string reportFolder = ConfigurationManager.AppSettings["ReportFolder"];
             if (reportFolder.StartsWith("~"))
@@ -263,6 +368,8 @@ public class CrystalReportController : ApiController
             reportDoc = new ReportDocument();
             reportDoc.Load(rptPath);
 
+            NormalizeReportOptions(reportDoc);
+
             // --- Apply DB logon (main + subreports) ---
             if (provider == "odbc")
             {
@@ -273,6 +380,13 @@ public class CrystalReportController : ApiController
             {
                 ApplyDbLogon(reportDoc, "oledb", server, db, user, pwd, isOdbcRdo: false);
             }
+
+            // Optional: only works if you added {?ShowGrouping} in the RPT and wired suppression to it.
+            TrySetBoolParam(reportDoc, "ShowGrouping", true);
+
+            // Hard override: make sure GH/GF sections aren't suppressed.
+            ForceShowGroupSections(reportDoc);
+
 
             var connError = TestConnections(reportDoc);
             if (!string.IsNullOrEmpty(connError))
@@ -396,11 +510,46 @@ public class CrystalReportController : ApiController
             string contentType = "application/pdf";
             string fileExt = "pdf";
 
-            if (!string.IsNullOrEmpty(docType) && docType.ToLower().Contains("excel"))
+            var fmt = (docType ?? "").Trim().ToLowerInvariant();
+            switch (fmt)
             {
-                exportFormat = ExportFormatType.ExcelWorkbook;
-                contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-                fileExt = "xlsx";
+                case "excel-xls":
+                case "excel": // default legacy behavior
+                    exportFormat = ExportFormatType.Excel;      // BIFF8 .xls (formatted)
+                    contentType = "application/vnd.ms-excel";
+                    fileExt = "xls";
+                    break;
+
+                case "excel-dataonly":
+                    exportFormat = ExportFormatType.ExcelRecord; // Data-Only .xls
+                    contentType = "application/vnd.ms-excel";
+                    fileExt = "xls";
+                    break;
+
+                case "excel-xlsx":
+                case "excel-2007":
+                case "excel-2007plus":
+                    exportFormat = ExportFormatType.ExcelWorkbook; // .xlsx
+                    contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+                    fileExt = "xlsx";
+                    break;
+            }
+
+            try
+            {
+                if (exportFormat == ExportFormatType.Excel || exportFormat == ExportFormatType.ExcelWorkbook)
+                {
+                    var x = new ExcelFormatOptions
+                    {
+                        ExcelUseConstantColumnWidth = false,
+                        ExcelConstantColumnWidth = 0,
+                        ShowGridLines = false
+                    };
+                    reportDoc.ExportOptions.FormatOptions = x;
+                }
+            }
+            catch
+            {
             }
 
             // --- 7) Special handling for 3 certificate reports ---
