@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Configuration;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
@@ -571,12 +572,60 @@ public class CrystalReportController : ApiController
                 reportDoc.ExportToDisk(exportFormat, tempFile);
 
                 string certPath = ConfigurationManager.AppSettings["SPSLoadCertificatePath"];
-                string safeFile = val != null ? val.Replace("/", "").Replace("|", "_").Replace("&", "_") : "Cert";
+                string domain = ConfigurationManager.AppSettings["UploadUser_Domain"];
+                string uploadUser = ConfigurationManager.AppSettings["UploadUser_Name"];
+                string uploadPwd = ConfigurationManager.AppSettings["UploadUser_Pwd"];
+
+
+                string safeFile;
+
+                if (!string.IsNullOrEmpty(val))
+                {
+                    // Split by '|', skip the first (username)
+                    string[] parts = val.Split('|');
+                    string noUserVal = string.Join("_", parts.Skip(1)); // SPYTL_CRJGR-3-BR_PW/CRJGR-3-BR/L&M/M&E/AC.ELE/039_1
+
+                    // Clean up special characters for filename
+                    safeFile = noUserVal
+                        .Replace("/", "")   // remove slashes completely
+                        .Replace("&", "_")  // replace ampersands with underscores
+                        .Replace("|", "_")  // just in case
+                        .Replace(" ", "")   // remove spaces
+                        .Replace(".", "");  // remove dots inside code segments
+                }
+                else
+                {
+                    safeFile = "Cert";
+                }
+
+
+                //string safeFile = val != null ? val.Replace("/", "").Replace("|", "_").Replace("&", "_") : "Cert";
                 string suffix = string.IsNullOrEmpty(printNo) ? "" : "_" + printNo;
                 string certFile = Path.Combine(certPath, string.Format("{0}{1}.pdf", safeFile, suffix));
 
-                // Always export a PDF copy to the cert path
-                reportDoc.ExportToDisk(ExportFormatType.PortableDocFormat, certFile);
+                // --- Run inside impersonation (Added try/catch for debugging UNC export issues) ---
+                try
+                {
+                    using (var imp = new ImpersonationHelper(domain, uploadUser, uploadPwd))
+                    {
+                        Console.WriteLine($"Attempting UNC export to: {certFile} under impersonated user: {uploadUser}@{domain}");
+                        // Always export a PDF copy to the cert path (UNC path)
+                        reportDoc.ExportToDisk(ExportFormatType.PortableDocFormat, certFile);
+                        Console.WriteLine("UNC export successful.");
+                    }
+                }
+                catch (UnauthorizedAccessException authEx)
+                {
+                    // Catch specifically for LogonUser failure (bad credentials, domain issue)
+                    Console.WriteLine($"IMPERSONATION FAILED (UnauthorizedAccess): Credentials issue or domain unreachable. Details: {authEx.Message}");
+                    // Do not rethrow, allow the temp file result to be returned.
+                }
+                catch (Exception impEx)
+                {
+                    // Catches CrystalReports.ExportToDisk or other impersonation setup issues
+                    Console.WriteLine($"UNC EXPORT FAILED (Impersonation block General Error): {impEx.Message}");
+                    // Do not rethrow, allow the temp file result to be returned.
+                }
 
                 var result = new HttpResponseMessage(HttpStatusCode.OK);
                 result.Content = new StreamContent(new FileStream(tempFile, FileMode.Open, FileAccess.Read));
