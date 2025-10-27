@@ -590,14 +590,12 @@ public class CrystalReportController : ApiController
                         .Replace("/", "")   // remove slashes completely
                         .Replace("&", "_")  // replace ampersands with underscores
                         .Replace("|", "_")  // just in case
-                        .Replace(" ", "")   // remove spaces
-                        .Replace(".", "");  // remove dots inside code segments
+                        .Replace(" ", "");   // remove spaces
                 }
                 else
                 {
                     safeFile = "Cert";
                 }
-
 
                 //string safeFile = val != null ? val.Replace("/", "").Replace("|", "_").Replace("&", "_") : "Cert";
                 string suffix = string.IsNullOrEmpty(printNo) ? "" : "_" + printNo;
