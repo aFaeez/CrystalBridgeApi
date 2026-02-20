@@ -561,87 +561,51 @@ public class CrystalReportController : ApiController
 
             if (isCertReport)
             {
-                if (!string.IsNullOrWhiteSpace(userName))
-                {
-                    foreach (ParameterFieldDefinition f in crParams)
-                        if (f.Name.Equals("userName", StringComparison.OrdinalIgnoreCase))
-                        { SetDiscreteParam(f, userName); break; }
-                }
-
-                string tempFile = Path.Combine(reportFolder, string.Format("{0}.{1}", Guid.NewGuid(), fileExt));
-                reportDoc.ExportToDisk(exportFormat, tempFile);
-
                 string certPath = ConfigurationManager.AppSettings["SPSLoadCertificatePath"];
                 string domain = ConfigurationManager.AppSettings["UploadUser_Domain"];
                 string uploadUser = ConfigurationManager.AppSettings["UploadUser_Name"];
                 string uploadPwd = ConfigurationManager.AppSettings["UploadUser_Pwd"];
 
-
-                string safeFile;
-
+                // 1. Generate the Safe Filename
+                string safeFile = "Cert";
                 if (!string.IsNullOrEmpty(val))
                 {
-                    // Split by '|', skip the first (username)
                     string[] parts = val.Split('|');
-                    string noUserVal = string.Join("_", parts.Skip(1)); // SPYTL_CRJGR-3-BR_PW/CRJGR-3-BR/L&M/M&E/AC.ELE/039_1
-
-                    // Clean up special characters for filename
-                    safeFile = noUserVal
-                        .Replace("/", "")   // remove slashes completely
-                        .Replace("&", "_")  // replace ampersands with underscores
-                        .Replace("|", "_")  // just in case
-                        .Replace(" ", "");   // remove spaces
+                    string noUserVal = string.Join("_", parts.Skip(1));
+                    safeFile = noUserVal.Replace("/", "").Replace("&", "_").Replace("|", "_").Replace(" ", "");
                 }
-                else
-                {
-                    safeFile = "Cert";
-                }
-
                 //string safeFile = val != null ? val.Replace("/", "").Replace("|", "_").Replace("&", "_") : "Cert";
                 string suffix = string.IsNullOrEmpty(printNo) ? "" : "_" + printNo;
                 string certFile = Path.Combine(certPath, string.Format("{0}{1}.pdf", safeFile, suffix));
 
-                // --- Run inside impersonation (Added try/catch for debugging UNC export issues) ---
+                // 2. Use a truly temporary local path for the stream return (Windows Temp)
+                // This avoids the Permission Denied error in C:\inetpub\wwwroot
+                string tempFile = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + ".pdf");
+
                 try
                 {
                     using (var imp = new ImpersonationHelper(domain, uploadUser, uploadPwd))
                     {
-                        Console.WriteLine($"Attempting UNC export to: {certFile} under impersonated user: {uploadUser}@{domain}");
-                        // Always export a PDF copy to the cert path (UNC path)
+                        // Export directly to your SPSLoadCertificatePath (UNC/Network Path)
                         reportDoc.ExportToDisk(ExportFormatType.PortableDocFormat, certFile);
-                        Console.WriteLine("UNC export successful.");
+
+                        // Also export to the temp location so we can return the file to the browser
+                        reportDoc.ExportToDisk(ExportFormatType.PortableDocFormat, tempFile);
                     }
                 }
-                catch (UnauthorizedAccessException authEx)
+                catch (Exception ex)
                 {
-                    // Catch specifically for LogonUser failure (bad credentials, domain issue)
-                    Console.WriteLine($"IMPERSONATION FAILED (UnauthorizedAccess): Credentials issue or domain unreachable. Details: {authEx.Message}");
-                    // Do not rethrow, allow the temp file result to be returned.
-                }
-                catch (Exception impEx)
-                {
-                    // Catches CrystalReports.ExportToDisk or other impersonation setup issues
-                    Console.WriteLine($"UNC EXPORT FAILED (Impersonation block General Error): {impEx.Message}");
-                    // Do not rethrow, allow the temp file result to be returned.
+                    // Log error (Environment.NewLine for cleaner logs)
+                    Console.WriteLine("EXPORT ERROR: " + ex.Message);
+                    // Fallback: If impersonation fails, try to at least export locally to return to user
+                    // But this will likely fail if permissions aren't set.
                 }
 
+                // 3. Return the file from the Temp Path
                 var result = new HttpResponseMessage(HttpStatusCode.OK);
-                result.Content = new StreamContent(new FileStream(tempFile, FileMode.Open, FileAccess.Read));
-                result.Content.Headers.ContentType =
-                    new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
-                result.Content.Headers.ContentDisposition =
-                    new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
-                    { FileName = string.Format("{0}.{1}", reportName, fileExt) };
-
-                _ = System.Threading.Tasks.Task.Run(() =>
-                {
-                    try
-                    {
-                        System.Threading.Thread.Sleep(5000);
-                        if (File.Exists(tempFile)) File.Delete(tempFile);
-                    }
-                    catch { }
-                });
+                var stream = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.None, 4096, FileOptions.DeleteOnClose);
+                result.Content = new StreamContent(stream);
+                result.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
 
                 return result;
             }
