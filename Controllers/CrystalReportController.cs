@@ -360,44 +360,13 @@ public class CrystalReportController : ApiController
             string provider = string.IsNullOrWhiteSpace(connType) ? defaultProvider : connType.ToLowerInvariant();
 
             // --- Locate report ---
-            string certPathRpt = ConfigurationManager.AppSettings["SPSLoadCertificatePath"];
-            string domain = ConfigurationManager.AppSettings["UploadUser_Domain"];
-            string uploadUser = ConfigurationManager.AppSettings["UploadUser_Name"];
-            string uploadPwd = ConfigurationManager.AppSettings["UploadUser_Pwd"];
+            string rptPath = Path.Combine(reportFolder, reportName + ".rpt");
+            if (!File.Exists(rptPath))
+                return Request.CreateErrorResponse(HttpStatusCode.NotFound, "Report not found: " + rptPath);
 
-            string[] certReports =
-            {
-                "CertificateWithAppendixWithFS_IN",
-                "CertificateWithAppendixWithFS_EXT",
-                "CertificateWithAppendix"
-            };
-
-            bool isCertReport = certReports.Contains(reportName, StringComparer.OrdinalIgnoreCase);
-
-            string rptPath = isCertReport
-                ? Path.Combine(certPathRpt, reportName + ".rpt")
-                : Path.Combine(reportFolder, reportName + ".rpt");
-
+            // --- Load report ---
             reportDoc = new ReportDocument();
-
-            if (isCertReport)
-            {
-                // Access UNC path using impersonation
-                using (var imp = new ImpersonationHelper(domain, uploadUser, uploadPwd))
-                {
-                    if (!File.Exists(rptPath))
-                        return Request.CreateErrorResponse(HttpStatusCode.NotFound, "Report not found: " + rptPath);
-
-                    reportDoc.Load(rptPath);
-                }
-            }
-            else
-            {
-                if (!File.Exists(rptPath))
-                    return Request.CreateErrorResponse(HttpStatusCode.NotFound, "Report not found: " + rptPath);
-
-                reportDoc.Load(rptPath);
-            }
+            reportDoc.Load(rptPath);
 
             NormalizeReportOptions(reportDoc);
 
@@ -584,9 +553,18 @@ public class CrystalReportController : ApiController
             }
 
             // --- 7) Special handling for 3 certificate reports ---
+            bool isCertReport =
+                reportName.Equals("CertificateWithAppendixWithFS_IN", StringComparison.OrdinalIgnoreCase) ||
+                reportName.Equals("CertificateWithAppendixWithFS_EXT", StringComparison.OrdinalIgnoreCase) ||
+                reportName.Equals("CertificateWithAppendix", StringComparison.OrdinalIgnoreCase);
 
             if (isCertReport)
             {
+                string certPath = ConfigurationManager.AppSettings["SPSLoadCertificatePath"];
+                string domain = ConfigurationManager.AppSettings["UploadUser_Domain"];
+                string uploadUser = ConfigurationManager.AppSettings["UploadUser_Name"];
+                string uploadPwd = ConfigurationManager.AppSettings["UploadUser_Pwd"];
+
                 // 1. Generate the Safe Filename
                 string safeFile = "Cert";
                 if (!string.IsNullOrEmpty(val))
@@ -597,7 +575,7 @@ public class CrystalReportController : ApiController
                 }
                 //string safeFile = val != null ? val.Replace("/", "").Replace("|", "_").Replace("&", "_") : "Cert";
                 string suffix = string.IsNullOrEmpty(printNo) ? "" : "_" + printNo;
-                string certFile = Path.Combine(certPathRpt, string.Format("{0}{1}.pdf", safeFile, suffix));
+                string certFile = Path.Combine(certPath, string.Format("{0}{1}.pdf", safeFile, suffix));
 
                 // 2. Use a truly temporary local path for the stream return (Windows Temp)
                 // This avoids the Permission Denied error in C:\inetpub\wwwroot
