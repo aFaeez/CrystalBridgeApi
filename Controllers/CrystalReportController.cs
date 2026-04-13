@@ -3,12 +3,13 @@ using CrystalDecisions.Shared;
 using System;
 using System.Collections.Generic;
 using System.Configuration;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
-using System.Threading;
+using System.Reflection;
 using System.Web.Hosting;
 using System.Web.Http;
 
@@ -303,16 +304,70 @@ public class CrystalReportController : ApiController
 
     private static void NormalizeReportOptions(ReportDocument doc)
     {
-        // These two exist on older runtimes; ignore if not.
-        try { doc.ReportOptions.EnableSaveDataWithReport = false; } catch { }
-        try { doc.ReportOptions.ConvertNullFieldToDefault = true; } catch { }
+        // Log Crystal runtime version to help diagnose server/local mismatches.
+        LogCrystalRuntime();
+
+        // Avoid direct calls that can JIT-fail on older runtimes.
+        bool saveDataSet = TrySetReportOptionBool(doc, "EnableSaveDataWithReport", false);
+        if (!saveDataSet)
+            LogCrystal("ReportOptions.EnableSaveDataWithReport not available or not settable. Skipping.");
+
+        bool convertNullSet = TrySetReportOptionBool(doc, "ConvertNullFieldToDefault", true);
+        if (!convertNullSet)
+            LogCrystal("ReportOptions.ConvertNullFieldToDefault not available. Fallback: skipping.");
 
         // Older runtimes don't have DiscardSavedData(). Use Refresh() instead.
         try { doc.Refresh(); } catch { }
     }
 
+    private static bool TrySetReportOptionBool(ReportDocument doc, string propName, bool value)
+    {
+        try
+        {
+            var opts = doc.ReportOptions;
+            if (opts == null) return false;
 
+            var prop = opts.GetType().GetProperty(propName, BindingFlags.Instance | BindingFlags.Public);
+            if (prop == null || !prop.CanWrite) return false;
+            if (prop.PropertyType != typeof(bool)) return false;
 
+            prop.SetValue(opts, value, null);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LogCrystal($"Failed setting ReportOptions.{propName}: {ex.GetType().Name} - {ex.Message}");
+            return false;
+        }
+    }
+
+    private static void LogCrystalRuntime()
+    {
+        try
+        {
+            var asm = typeof(ReportDocument).Assembly;
+            var name = asm.GetName();
+            string fileVersion = null;
+            try
+            {
+                var fvi = FileVersionInfo.GetVersionInfo(asm.Location);
+                fileVersion = fvi.FileVersion;
+            }
+            catch { }
+
+            LogCrystal($"Crystal runtime assembly: {name.FullName}; AssemblyVersion={name.Version}; FileVersion={fileVersion}; Location={asm.Location}");
+        }
+        catch (Exception ex)
+        {
+            LogCrystal("Failed to read Crystal runtime version: " + ex.GetType().Name + " - " + ex.Message);
+        }
+    }
+
+    private static void LogCrystal(string message)
+    {
+        try { Trace.WriteLine(message); } catch { }
+        try { Console.WriteLine(message); } catch { }
+    }
 
     [HttpGet]
     [Route("api/crystalreport/exporttopdf")]
@@ -361,13 +416,146 @@ public class CrystalReportController : ApiController
             string provider = string.IsNullOrWhiteSpace(connType) ? defaultProvider : connType.ToLowerInvariant();
 
             // --- Locate report ---
-            string rptPath = Path.Combine(reportFolder, reportName + ".rpt");
-            if (!File.Exists(rptPath))
-                return Request.CreateErrorResponse(HttpStatusCode.NotFound, "Report not found: " + rptPath);
+            string certPathRpt = ConfigurationManager.AppSettings["SPSLoadCertificatePath"];
+            string domain = ConfigurationManager.AppSettings["UploadUser_Domain"];
+            string uploadUser = ConfigurationManager.AppSettings["UploadUser_Name"];
+            string uploadPwd = ConfigurationManager.AppSettings["UploadUser_Pwd"];
 
-            // --- Load report ---
+            string[] certReports =
+            {
+                "CertificateWithAppendixWithFS_IN",
+                "CertificateWithAppendixWithFS_EXT",
+                "CertificateWithAppendix"
+            };
+
+            bool isCertReport = certReports.Contains(reportName, StringComparer.OrdinalIgnoreCase);
+
+            string rptPath = isCertReport
+                ? Path.Combine(certPathRpt, reportName + ".rpt")
+                : Path.Combine(reportFolder, reportName + ".rpt");
+
             reportDoc = new ReportDocument();
-            reportDoc.Load(rptPath);
+
+            if (isCertReport)
+            {
+                string certFile = null;
+                using (var imp = new ImpersonationHelper(domain, uploadUser, uploadPwd))
+                {
+                    //  ALL file access inside impersonation
+                    if (!File.Exists(rptPath))
+                        return Request.CreateErrorResponse(HttpStatusCode.NotFound, "Report not found: " + rptPath);
+
+                    LogCrystal("Loading cert report: " + rptPath);
+                    reportDoc.Load(rptPath);
+                    LogCrystal("Report loaded OK");
+
+                    NormalizeReportOptions(reportDoc);
+
+                    // DB Logon inside impersonation
+                    if (provider == "odbc")
+                    {
+                        var dsn = string.IsNullOrWhiteSpace(odbcDsn) ? server : odbcDsn;
+                        ApplyDbLogon(reportDoc, "odbc", dsn, db, odbcUser, odbcPwd, isOdbcRdo: true);
+                    }
+                    else
+                    {
+                        ApplyDbLogon(reportDoc, "oledb", server, db, user, pwd, isOdbcRdo: false);
+                    }
+
+                    TrySetBoolParam(reportDoc, "ShowGrouping", true);
+                    ForceShowGroupSections(reportDoc);
+
+                    var connError2 = TestConnections(reportDoc);
+                    if (!string.IsNullOrEmpty(connError2))
+                    {
+                        return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, connError2);
+                    }
+
+                    //  Set ALL parameters inside impersonation
+                    var crParamsCert = reportDoc.DataDefinition.ParameterFields;
+
+                    if (!string.IsNullOrEmpty(para) && !string.IsNullOrEmpty(val))
+                    {
+                        string safeVal = val.Replace("_", "&");
+                        string[] paraArr = para.Split('|');
+                        string[] valArr = safeVal.Split('|');
+                        if (paraArr.Length != valArr.Length)
+                            throw new Exception("Param mismatch. para=" + para + " val=" + val);
+                        for (int i = 0; i < paraArr.Length; i++)
+                            foreach (ParameterFieldDefinition f in crParamsCert)
+                                if (f.Name.Equals(paraArr[i], StringComparison.OrdinalIgnoreCase))
+                                { SetDiscreteParam(f, valArr[i]); break; }
+                    }
+
+                    if (!string.IsNullOrEmpty(printNo))
+                        foreach (ParameterFieldDefinition f in crParamsCert)
+                            if (f.Name.Equals("printNo", StringComparison.OrdinalIgnoreCase))
+                            { SetDiscreteParam(f, printNo); break; }
+
+                    if (!string.IsNullOrEmpty(isPW))
+                        foreach (ParameterFieldDefinition f in crParamsCert)
+                            if (f.Name.Equals("isPW", StringComparison.OrdinalIgnoreCase))
+                            { SetDiscreteParam(f, isPW); break; }
+
+                    if (!string.IsNullOrEmpty(isQSME))
+                        foreach (ParameterFieldDefinition f in crParamsCert)
+                            if (f.Name.Equals("isQSME", StringComparison.OrdinalIgnoreCase))
+                            { SetDiscreteParam(f, isQSME); break; }
+
+                    if (!string.IsNullOrEmpty(file))
+                        foreach (ParameterFieldDefinition f in crParamsCert)
+                            if (f.Name.Equals("file", StringComparison.OrdinalIgnoreCase))
+                            { SetDiscreteParam(f, file); break; }
+
+                    if (!string.IsNullOrEmpty(docType))
+                        foreach (ParameterFieldDefinition f in crParamsCert)
+                            if (f.Name.Equals("docType", StringComparison.OrdinalIgnoreCase))
+                            { SetDiscreteParam(f, docType); break; }
+
+                    //  Build cert save path
+                    string safeFile = "Cert";
+                    if (!string.IsNullOrEmpty(val))
+                    {
+                        string[] parts = val.Split('|');
+                        string noUserVal = string.Join("_", parts.Skip(1));
+                        safeFile = noUserVal.Replace("/", "").Replace("&", "_").Replace("|", "_").Replace(" ", "");
+                    }
+                    string suffix = string.IsNullOrEmpty(printNo) ? "" : "_" + printNo;
+                    certFile = Path.Combine(certPathRpt, string.Format("{0}{1}.pdf", safeFile, suffix));
+
+                    //  Export history file inside impersonation (UNC)
+                    LogCrystal("Exporting cert to: " + certFile);
+
+                    try
+                    {
+                        reportDoc.ExportToDisk(ExportFormatType.PortableDocFormat, certFile);
+                        LogCrystal("Cert export OK");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogCrystal("Cert file export failed (non-fatal): " + ex.Message);
+                    }
+
+                } //  impersonation ends AFTER export to history file
+
+                // Return directly to client without temp file
+                Stream certStream = reportDoc.ExportToStream(ExportFormatType.PortableDocFormat);
+                certStream.Seek(0, SeekOrigin.Begin);
+                var certResult = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StreamContent(certStream)
+                };
+                certResult.Content.Headers.ContentType =
+                    new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+                return certResult;
+            }
+            else
+            {
+                // non-cert reports — existing logic unchanged
+                if (!File.Exists(rptPath))
+                    return Request.CreateErrorResponse(HttpStatusCode.NotFound, "Report not found: " + rptPath);
+                reportDoc.Load(rptPath);
+            }
 
             NormalizeReportOptions(reportDoc);
 
@@ -553,62 +741,6 @@ public class CrystalReportController : ApiController
             {
             }
 
-            // --- 7) Special handling for 3 certificate reports ---
-            bool isCertReport =
-                reportName.Equals("CertificateWithAppendixWithFS_IN", StringComparison.OrdinalIgnoreCase) ||
-                reportName.Equals("CertificateWithAppendixWithFS_EXT", StringComparison.OrdinalIgnoreCase) ||
-                reportName.Equals("CertificateWithAppendix", StringComparison.OrdinalIgnoreCase);
-
-            if (isCertReport)
-            {
-                string certPath = ConfigurationManager.AppSettings["SPSLoadCertificatePath"];
-                string domain = ConfigurationManager.AppSettings["UploadUser_Domain"];
-                string uploadUser = ConfigurationManager.AppSettings["UploadUser_Name"];
-                string uploadPwd = ConfigurationManager.AppSettings["UploadUser_Pwd"];
-
-                // 1. Generate the Safe Filename
-                string safeFile = "Cert";
-                if (!string.IsNullOrEmpty(val))
-                {
-                    string[] parts = val.Split('|');
-                    string noUserVal = string.Join("_", parts.Skip(1));
-                    safeFile = noUserVal.Replace("/", "").Replace("&", "_").Replace("|", "_").Replace(" ", "");
-                }
-                //string safeFile = val != null ? val.Replace("/", "").Replace("|", "_").Replace("&", "_") : "Cert";
-                string suffix = string.IsNullOrEmpty(printNo) ? "" : "_" + printNo;
-                string certFile = Path.Combine(certPath, string.Format("{0}{1}.pdf", safeFile, suffix));
-
-                // 2. Use a truly temporary local path for the stream return (Windows Temp)
-                // This avoids the Permission Denied error in C:\inetpub\wwwroot
-                string tempFile = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + ".pdf");
-
-                try
-                {
-                    using (var imp = new ImpersonationHelper(domain, uploadUser, uploadPwd))
-                    {
-                        // Export directly to your SPSLoadCertificatePath (UNC/Network Path)
-                        reportDoc.ExportToDisk(ExportFormatType.PortableDocFormat, certFile);
-
-                        // Also export to the temp location so we can return the file to the browser
-                        reportDoc.ExportToDisk(ExportFormatType.PortableDocFormat, tempFile);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    // Log error (Environment.NewLine for cleaner logs)
-                    Console.WriteLine("EXPORT ERROR: " + ex.Message);
-                    // Fallback: If impersonation fails, try to at least export locally to return to user
-                    // But this will likely fail if permissions aren't set.
-                }
-
-                // 3. Return the file from the Temp Path
-                var result = new HttpResponseMessage(HttpStatusCode.OK);
-                var stream = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.None, 4096, FileOptions.DeleteOnClose);
-                result.Content = new StreamContent(stream);
-                result.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
-
-                return result;
-            }
 
             // --- 8) Normal path: export to stream ---
             Stream exportStream = reportDoc.ExportToStream(exportFormat);
@@ -644,5 +776,59 @@ public class CrystalReportController : ApiController
             }
             catch { }
         }
+    }
+
+    [HttpGet]
+    [Route("api/crystalreport/diagcert")]
+    public IHttpActionResult DiagCert()
+    {
+        var sb = new System.Text.StringBuilder();
+        try
+        {
+            string certPathRpt = ConfigurationManager.AppSettings["SPSLoadCertificatePath"];
+            string domain = ConfigurationManager.AppSettings["UploadUser_Domain"];
+            string uploadUser = ConfigurationManager.AppSettings["UploadUser_Name"];
+            string uploadPwd = ConfigurationManager.AppSettings["UploadUser_Pwd"];
+
+            sb.AppendLine("certPathRpt=" + certPathRpt);
+            sb.AppendLine("domain=" + domain);
+            sb.AppendLine("uploadUser=" + uploadUser);
+            sb.AppendLine("tempPath=" + Path.GetTempPath());
+
+            // Test 1: Can we impersonate?
+            using (var imp = new ImpersonationHelper(domain, uploadUser, uploadPwd))
+            {
+                sb.AppendLine("Impersonation: OK");
+
+                // Test 2: Can we see the folder?
+                bool dirExists = Directory.Exists(certPathRpt);
+                sb.AppendLine("Directory exists: " + dirExists);
+
+                if (dirExists)
+                {
+                    // Test 3: List .rpt files
+                    var files = Directory.GetFiles(certPathRpt, "*.rpt");
+                    sb.AppendLine("RPT files found: " + files.Length);
+                    foreach (var f in files)
+                        sb.AppendLine("  " + f);
+                }
+            }
+
+            // Test 4: Can we write to temp?
+            string testTemp = Path.Combine(Path.GetTempPath(), "test_" + Guid.NewGuid() + ".tmp");
+            File.WriteAllText(testTemp, "ok");
+            File.Delete(testTemp);
+            sb.AppendLine("Temp write: OK");
+
+            // Test 5: Crystal runtime version
+            var asm = typeof(ReportDocument).Assembly;
+            sb.AppendLine("Crystal version: " + asm.GetName().Version);
+        }
+        catch (Exception ex)
+        {
+            sb.AppendLine("ERROR: " + ex.GetType().Name + " - " + ex.Message);
+        }
+
+        return Ok(sb.ToString());
     }
 }
