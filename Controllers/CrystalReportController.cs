@@ -15,6 +15,21 @@ using System.Web.Http;
 
 public class CrystalReportController : ApiController
 {
+    private static void ReplaceDataSourceConnection(
+        ReportDocument reportDoc,
+        string server,
+        string database,
+        string user,
+        string password)
+    {
+        for (int i = 0; i < reportDoc.DataSourceConnections.Count; i++)
+        {
+            var connection = reportDoc.DataSourceConnections[i];
+            connection.SetConnection(server, database ?? string.Empty, false);
+            connection.SetLogon(user, password);
+        }
+    }
+
     private static void ApplyDbLogon(
         ReportDocument reportDoc,
         string provider,     // "oledb" or "odbc" (RDO)
@@ -35,6 +50,16 @@ public class CrystalReportController : ApiController
         // RDO quirk: do NOT push DatabaseName, and do NOT force <db>.dbo.<table>
         if (!isOdbcRdo)
             conn.DatabaseName = database ?? "";
+
+        // Replace the connection embedded in each RPT with the environment
+        // configured in Web.config before applying table-level logon details.
+        if (!isOdbcRdo)
+        {
+            ReplaceDataSourceConnection(reportDoc, serverOrDsn, database, user, pwd);
+
+            foreach (ReportDocument subreport in reportDoc.Subreports)
+                ReplaceDataSourceConnection(subreport, serverOrDsn, database, user, pwd);
+        }
 
         void ApplyToTable(Table table)
         {
@@ -61,7 +86,15 @@ public class CrystalReportController : ApiController
             // Qualify only plain tables, and only when we actually have a database name
             if (!string.IsNullOrEmpty(database))
             {
-                try { table.Location = $"{database}.dbo.{table.Name}"; } catch { /* ignore */ }
+                try
+                {
+                    table.Location = $"{database}.dbo.{table.Name}";
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException(
+                        $"Failed changing table location for '{table.Name}'.", ex);
+                }
             }
         }
 
